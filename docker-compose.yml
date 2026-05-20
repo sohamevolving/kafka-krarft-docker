@@ -1,0 +1,381 @@
+version: "3.8"
+
+# ═══════════════════════════════════════════════════════════════════
+#  Production-grade KRaft (ZooKeeper-less) Kafka Cluster
+#  + Transactional Mirror Service (3 instances)
+#
+#  Topology
+#  ┌─────────────────────────────────────────────────────────┐
+#  │  kafka-1  (broker + controller)  Node ID: 1             │
+#  │  kafka-2  (broker + controller)  Node ID: 2             │
+#  │  kafka-3  (broker + controller)  Node ID: 3             │
+#  │  schema-registry-1               Port: 8081             │
+#  │  schema-registry-2               Port: 8082             │
+#  │  mirror-instance-1  ─┐                                  │
+#  │  mirror-instance-2  ─┼─ consumer group, EOS             │
+#  │  mirror-instance-3  ─┘                                  │
+#  └─────────────────────────────────────────────────────────┘
+#
+#  Fault Tolerance
+#  ┌──────────────────────────────────────────────────────────┐
+#  │  Quorum      : 3 controllers → majority = 2/3           │
+#  │                tolerates 1 controller failure            │
+#  │  Replication : RF=3, min.isr=2, acks=all                │
+#  │                tolerates 1 broker failure, no data loss  │
+#  │  Mirror EOS  : transactional producer + read_committed   │
+#  │                consumer + atomic offset commits          │
+#  └──────────────────────────────────────────────────────────┘
+#
+#  Port Map
+#  ┌──────────┬──────────┬──────────┬────────────┐
+#  │ Broker   │ EXTERNAL │ INTERNAL │ CONTROLLER │
+#  ├──────────┼──────────┼──────────┼────────────┤
+#  │ kafka-1  │  9092    │  29092   │   19092    │
+#  │ kafka-2  │  9093    │  29093   │   19093    │
+#  │ kafka-3  │  9094    │  29094   │   19094    │
+#  └──────────┴──────────┴──────────┴────────────┘
+#
+#  Generate a fresh Cluster ID (run once per environment):
+#    docker run --rm confluentinc/cp-kafka:7.6.0 kafka-storage random-uuid
+# ═══════════════════════════════════════════════════════════════════
+
+# ── Shared anchors ───────────────────────────────────────────────────
+x-kafka-common: &kafka-common
+  image: confluentinc/cp-kafka:7.6.0
+  restart: unless-stopped
+  networks:
+    - kafka-net
+
+x-kafka-common-env: &kafka-common-env
+
+  # ── KRaft cluster identity ────────────────────────────────────────
+  CLUSTER_ID: "4L6g3nShT-eMCtK--X86sw"      # ⚠️  Replace in real production!
+
+  # ── Combined mode: each node is both broker AND controller ────────
+  KAFKA_PROCESS_ROLES: "broker,controller"
+
+  # ── All 3 nodes participate in Raft controller quorum ─────────────
+  KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka-1:19092,2@kafka-2:19093,3@kafka-3:19094"
+
+  # ── Listener protocol mapping ─────────────────────────────────────
+  KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: >-
+    INTERNAL:PLAINTEXT,
+    EXTERNAL:PLAINTEXT,
+    CONTROLLER:PLAINTEXT
+
+  KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+  KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+  # ── ISR & Durability ─────────────────────────────────────────────
+  KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+  KAFKA_NUM_PARTITIONS: 6          # 6 partitions → 2 per mirror instance
+
+  KAFKA_MIN_INSYNC_REPLICAS: 2
+
+  KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+  KAFKA_OFFSETS_TOPIC_NUM_PARTITIONS: 3
+  KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+  KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+  KAFKA_TRANSACTION_STATE_LOG_NUM_PARTITIONS: 50
+
+  # ── Log / retention ───────────────────────────────────────────────
+  KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"   # topics created by kafka-init
+  KAFKA_LOG_RETENTION_HOURS: 168
+  KAFKA_LOG_SEGMENT_BYTES: 1073741824
+  KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS: 300000
+  KAFKA_LOG_DIRS: /var/lib/kafka/data
+
+  # ── Performance ───────────────────────────────────────────────────
+  KAFKA_REPLICA_LAG_TIME_MAX_MS: 30000
+  KAFKA_REPLICA_FETCH_MAX_BYTES: 1048576
+  KAFKA_MESSAGE_MAX_BYTES: 1048576
+
+  # ── Transactions ──────────────────────────────────────────────────
+  KAFKA_TRANSACTION_MAX_TIMEOUT_MS: 900000
+
+# Mirror service shared anchor
+x-mirror-common: &mirror-common
+  build:
+    context: ./mirror-service
+    dockerfile: Dockerfile
+  restart: unless-stopped
+  environment:
+    BOOTSTRAP_SERVERS: "kafka-1:29092,kafka-2:29093,kafka-3:29094"
+    SCHEMA_REGISTRY_URL: "http://schema-registry-1:8081"
+    PYTHONUNBUFFERED: "1"
+  depends_on:
+    kafka-init:
+      condition: service_completed_successfully
+    schema-registry-1:
+      condition: service_healthy
+  networks:
+    - kafka-net
+
+# ────────────────────────────────────────────────────────────────────
+
+networks:
+  kafka-net:
+    driver: bridge
+
+volumes:
+  kafka-1-data:
+  kafka-2-data:
+  kafka-3-data:
+
+services:
+
+  # ── Kafka Broker + Controller 1 ─────────────────────────────────
+  kafka-1:
+    <<: *kafka-common
+    container_name: kafka-1
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+      - "19092:19092"
+    volumes:
+      - kafka-1-data:/var/lib/kafka/data
+    environment:
+      <<: *kafka-common-env
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENERS: >-
+        INTERNAL://0.0.0.0:29092,
+        EXTERNAL://0.0.0.0:9092,
+        CONTROLLER://0.0.0.0:19092
+      KAFKA_ADVERTISED_LISTENERS: >-
+        INTERNAL://kafka-1:29092,
+        EXTERNAL://localhost:9092
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # ── Kafka Broker + Controller 2 ─────────────────────────────────
+  kafka-2:
+    <<: *kafka-common
+    container_name: kafka-2
+    ports:
+      - "9093:9093"
+      - "29093:29093"
+      - "19093:19093"
+    volumes:
+      - kafka-2-data:/var/lib/kafka/data
+    environment:
+      <<: *kafka-common-env
+      KAFKA_NODE_ID: 2
+      KAFKA_LISTENERS: >-
+        INTERNAL://0.0.0.0:29093,
+        EXTERNAL://0.0.0.0:9093,
+        CONTROLLER://0.0.0.0:19093
+      KAFKA_ADVERTISED_LISTENERS: >-
+        INTERNAL://kafka-2:29093,
+        EXTERNAL://localhost:9093
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9093"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # ── Kafka Broker + Controller 3 ─────────────────────────────────
+  kafka-3:
+    <<: *kafka-common
+    container_name: kafka-3
+    ports:
+      - "9094:9094"
+      - "29094:29094"
+      - "19094:19094"
+    volumes:
+      - kafka-3-data:/var/lib/kafka/data
+    environment:
+      <<: *kafka-common-env
+      KAFKA_NODE_ID: 3
+      KAFKA_LISTENERS: >-
+        INTERNAL://0.0.0.0:29094,
+        EXTERNAL://0.0.0.0:9094,
+        CONTROLLER://0.0.0.0:19094
+      KAFKA_ADVERTISED_LISTENERS: >-
+        INTERNAL://kafka-3:29094,
+        EXTERNAL://localhost:9094
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9094"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # ── Schema Registry 1 ───────────────────────────────────────────
+  schema-registry-1:
+    image: confluentinc/cp-schema-registry:7.6.0
+    container_name: schema-registry-1
+    restart: unless-stopped
+    networks:
+      - kafka-net
+    depends_on:
+      kafka-1:
+        condition: service_healthy
+      kafka-2:
+        condition: service_healthy
+      kafka-3:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry-1
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka-1:29092,kafka-2:29093,kafka-3:29094
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC: _schemas
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC_REPLICATION_FACTOR: 3
+      SCHEMA_REGISTRY_LEADER_ELIGIBILITY: "true"
+      SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL: BACKWARD
+      SCHEMA_REGISTRY_DELETE_SUBJECT_RESPONSE_CODES_ALLOWED: "true"
+      SCHEMA_REGISTRY_LOG4J_ROOT_LOGLEVEL: WARN
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8081/subjects || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+
+  # ── Schema Registry 2 ───────────────────────────────────────────
+  schema-registry-2:
+    image: confluentinc/cp-schema-registry:7.6.0
+    container_name: schema-registry-2
+    restart: unless-stopped
+    networks:
+      - kafka-net
+    depends_on:
+      kafka-1:
+        condition: service_healthy
+      kafka-2:
+        condition: service_healthy
+      kafka-3:
+        condition: service_healthy
+    ports:
+      - "8082:8082"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry-2
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka-1:29092,kafka-2:29093,kafka-3:29094
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8082
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC: _schemas
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC_REPLICATION_FACTOR: 3
+      SCHEMA_REGISTRY_LEADER_ELIGIBILITY: "true"
+      SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL: BACKWARD
+      SCHEMA_REGISTRY_DELETE_SUBJECT_RESPONSE_CODES_ALLOWED: "true"
+      SCHEMA_REGISTRY_LOG4J_ROOT_LOGLEVEL: WARN
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8082/subjects || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+
+  # ── Topic initialisation (one-shot) ─────────────────────────────
+  # Runs after all 3 brokers are healthy, creates source + sink topics
+  # with 6 partitions (2 per mirror instance) and RF=3, min.isr=2.
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka-init
+    networks:
+      - kafka-net
+    depends_on:
+      kafka-1:
+        condition: service_healthy
+      kafka-2:
+        condition: service_healthy
+      kafka-3:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        echo "[INIT] Creating Kafka topics ..."
+
+        kafka-topics --bootstrap-server kafka-1:29092 \
+          --create --if-not-exists \
+          --topic kolkata-locations-raw \
+          --partitions 6 \
+          --replication-factor 3 \
+          --config min.insync.replicas=2 \
+          --config retention.ms=604800000
+
+        kafka-topics --bootstrap-server kafka-1:29092 \
+          --create --if-not-exists \
+          --topic kolkata-locations-mirror \
+          --partitions 6 \
+          --replication-factor 3 \
+          --config min.insync.replicas=2 \
+          --config retention.ms=604800000
+
+        echo "[INIT] Topics created:"
+        kafka-topics --bootstrap-server kafka-1:29092 --list
+        echo "[INIT] Done."
+
+  # ── Mirror instance 1 ───────────────────────────────────────────
+  # cooperative-sticky assignor → gets partitions 0 & 1
+  # transactional.id = kolkata-mirror-raw-p0.p1
+  mirror-instance-1:
+    <<: *mirror-common
+    container_name: mirror-instance-1
+    environment:
+      BOOTSTRAP_SERVERS: "kafka-1:29092,kafka-2:29093,kafka-3:29094"
+      SCHEMA_REGISTRY_URL: "http://schema-registry-1:8081"
+      INSTANCE_ID: "1"
+      PYTHONUNBUFFERED: "1"
+
+  # ── Mirror instance 2 ───────────────────────────────────────────
+  # cooperative-sticky assignor → gets partitions 2 & 3
+  # transactional.id = kolkata-mirror-raw-p2.p3
+  mirror-instance-2:
+    <<: *mirror-common
+    container_name: mirror-instance-2
+    environment:
+      BOOTSTRAP_SERVERS: "kafka-1:29092,kafka-2:29093,kafka-3:29094"
+      SCHEMA_REGISTRY_URL: "http://schema-registry-1:8081"
+      INSTANCE_ID: "2"
+      PYTHONUNBUFFERED: "1"
+
+  # ── Mirror instance 3 ───────────────────────────────────────────
+  # cooperative-sticky assignor → gets partitions 4 & 5
+  # transactional.id = kolkata-mirror-raw-p4.p5
+  mirror-instance-3:
+    <<: *mirror-common
+    container_name: mirror-instance-3
+    environment:
+      BOOTSTRAP_SERVERS: "kafka-1:29092,kafka-2:29093,kafka-3:29094"
+      SCHEMA_REGISTRY_URL: "http://schema-registry-1:8081"
+      INSTANCE_ID: "3"
+      PYTHONUNBUFFERED: "1"
+
+# ═══════════════════════════════════════════════════════════════════
+#  QUICK START
+#
+#  docker compose up --build
+#
+#  Watch mirror workers:
+#    docker compose logs -f mirror-instance-1 mirror-instance-2 mirror-instance-3
+#
+#  Check KRaft quorum:
+#    docker exec kafka-1 kafka-metadata-quorum \
+#      --bootstrap-server localhost:9092 describe --status
+#
+#  Verify topic ISR:
+#    docker exec kafka-1 kafka-topics \
+#      --bootstrap-server localhost:9092 --describe \
+#      --topic kolkata-locations-raw
+#
+#  Inspect sink topic (read_committed):
+#    docker exec kafka-1 kafka-console-consumer \
+#      --bootstrap-server localhost:9092 \
+#      --topic kolkata-locations-mirror \
+#      --from-beginning \
+#      --isolation-level read_committed
+#
+#  Simulate broker failure:
+#    docker stop kafka-2
+#    → ISR shrinks to [kafka-1, kafka-3] (size=2 >= min.isr=2) ✅
+#    → Mirror workers reconnect and continue
+#
+#  Full teardown:
+#    docker compose down -v
+# ═══════════════════════════════════════════════════════════════════
