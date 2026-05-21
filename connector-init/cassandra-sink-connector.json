@@ -1,0 +1,40 @@
+{
+  "connector.class": "com.datastax.oss.kafka.sink.CassandraSinkConnector",
+
+  "tasks.max": "6",
+
+  "topics": "kolkata-locations-mirror",
+
+  "contactPoints": "cassandra-1,cassandra-2",
+  "port": "9042",
+  "loadBalancing.localDc": "datacenter1",
+
+  "topic.kolkata-locations-mirror.kolkata.locations.consistencyLevel": "LOCAL_QUORUM",
+
+  "topic.kolkata-locations-mirror.kolkata.locations.mapping": "id=value.id, name=value.name, zone=value.zone, district=value.district, pincode=value.pincode, latitude=value.latitude, longitude=value.longitude, landmark=value.landmark, ts_epoch=value.ts_epoch",
+
+  "topic.kolkata-locations-mirror.kolkata.locations.ttl": "-1",
+
+  "topic.kolkata-locations-mirror.kolkata.locations.deletesEnabled": "false",
+
+  "topic.kolkata-locations-mirror.kolkata.locations.nullToUnset": "true",
+
+  "key.converter":   "org.apache.kafka.connect.storage.StringConverter",
+  "value.converter": "io.confluent.connect.avro.AvroConverter",
+  "value.converter.schema.registry.url": "http://schema-registry-1:8081",
+
+  "consumer.isolation.level": "read_committed",
+
+  "datastax-java-driver.advanced.connection.pool.local.size": "2",
+  "datastax-java-driver.advanced.connection.max-requests-per-connection": "1024",
+  "datastax-java-driver.basic.request.timeout": "10 seconds",
+  "datastax-java-driver.advanced.retry-policy.class": "DefaultRetryPolicy",
+
+  "errors.tolerance":                               "all",
+  "errors.log.enable":                              "true",
+  "errors.log.include.messages":                    "true",
+
+  "errors.deadletterqueue.topic.name":              "kolkata-locations-mirror-dlq",
+  "errors.deadletterqueue.topic.replication.factor": "3",
+  "errors.deadletterqueue.context.headers.enable":  "true"
+}

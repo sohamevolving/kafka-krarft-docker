@@ -3,30 +3,31 @@ version: "3.8"
 # ═══════════════════════════════════════════════════════════════════
 #  Production-grade KRaft (ZooKeeper-less) Kafka Cluster
 #  + Transactional Mirror Service (3 instances)
+#  + Cassandra 2-Node Sink Cluster (RF=2, LOCAL_QUORUM)
+#  + Kafka Connect with DataStax Cassandra Sink Connector (6 tasks)
 #
-#  Topology
-#  ┌─────────────────────────────────────────────────────────┐
-#  │  kafka-1  (broker + controller)  Node ID: 1             │
-#  │  kafka-2  (broker + controller)  Node ID: 2             │
-#  │  kafka-3  (broker + controller)  Node ID: 3             │
-#  │  schema-registry-1               Port: 8081             │
-#  │  schema-registry-2               Port: 8082             │
-#  │  mirror-instance-1  ─┐                                  │
-#  │  mirror-instance-2  ─┼─ consumer group, EOS             │
-#  │  mirror-instance-3  ─┘                                  │
-#  └─────────────────────────────────────────────────────────┘
+#  Full Data Flow
+#  ┌──────────────────────────────────────────────────────────────┐
+#  │                                                              │
+#  │   [Producer]                                                 │
+#  │       │                                                      │
+#  │       ▼                                                      │
+#  │  kolkata-locations-raw  (6 partitions, RF=3, min.isr=2)     │
+#  │       │                                                      │
+#  │  mirror-instance-{1,2,3}  (EOS, cooperative-sticky)         │
+#  │       │   transactional produce + atomic offset commit       │
+#  │       ▼                                                      │
+#  │  kolkata-locations-mirror  (6 partitions, RF=3, min.isr=2)  │
+#  │       │                                                      │
+#  │  kafka-connect  (6 tasks, DataStax Cassandra Sink)          │
+#  │       │   read_committed, LOCAL_QUORUM writes                │
+#  │       ▼                                                      │
+#  │  cassandra-1 ──── cassandra-2                               │
+#  │  keyspace: kolkata  table: locations  RF=2                  │
+#  │                                                              │
+#  └──────────────────────────────────────────────────────────────┘
 #
-#  Fault Tolerance
-#  ┌──────────────────────────────────────────────────────────┐
-#  │  Quorum      : 3 controllers → majority = 2/3           │
-#  │                tolerates 1 controller failure            │
-#  │  Replication : RF=3, min.isr=2, acks=all                │
-#  │                tolerates 1 broker failure, no data loss  │
-#  │  Mirror EOS  : transactional producer + read_committed   │
-#  │                consumer + atomic offset commits          │
-#  └──────────────────────────────────────────────────────────┘
-#
-#  Port Map
+#  Broker / Port Map
 #  ┌──────────┬──────────┬──────────┬────────────┐
 #  │ Broker   │ EXTERNAL │ INTERNAL │ CONTROLLER │
 #  ├──────────┼──────────┼──────────┼────────────┤
@@ -34,6 +35,18 @@ version: "3.8"
 #  │ kafka-2  │  9093    │  29093   │   19093    │
 #  │ kafka-3  │  9094    │  29094   │   19094    │
 #  └──────────┴──────────┴──────────┴────────────┘
+#
+#  Cassandra / Port Map
+#  ┌─────────────┬────────┬──────────────────────┐
+#  │ Node        │  CQL   │ Role                 │
+#  ├─────────────┼────────┼──────────────────────┤
+#  │ cassandra-1 │  9042  │ Seed, RF participant │
+#  │ cassandra-2 │  9043  │ RF participant        │
+#  └─────────────┴────────┴──────────────────────┘
+#
+#  Kafka Connect REST  :  localhost:8083
+#  Schema Registry 1  :  localhost:8081
+#  Schema Registry 2  :  localhost:8082
 #
 #  Generate a fresh Cluster ID (run once per environment):
 #    docker run --rm confluentinc/cp-kafka:7.6.0 kafka-storage random-uuid
@@ -93,6 +106,23 @@ x-kafka-common-env: &kafka-common-env
   # ── Transactions ──────────────────────────────────────────────────
   KAFKA_TRANSACTION_MAX_TIMEOUT_MS: 900000
 
+# ── Cassandra shared anchor ──────────────────────────────────────────
+x-cassandra-common: &cassandra-common
+  image: cassandra:4.1
+  restart: unless-stopped
+  networks:
+    - kafka-net
+  environment: &cassandra-common-env
+    CASSANDRA_CLUSTER_NAME:    "KolkataCluster"
+    CASSANDRA_DC:              "datacenter1"
+    CASSANDRA_RACK:            "RAC1"
+    CASSANDRA_ENDPOINT_SNITCH: "GossipingPropertyFileSnitch"
+    # ── JVM Heap (tune to host RAM; 1 GB is safe for dev) ──────────
+    HEAP_NEWSIZE: "256M"
+    MAX_HEAP_SIZE: "1G"
+    # ── Reduce token contention on a 2-node ring ───────────────────
+    CASSANDRA_NUM_TOKENS: "16"
+
 # Mirror service shared anchor
 x-mirror-common: &mirror-common
   build:
@@ -121,6 +151,8 @@ volumes:
   kafka-1-data:
   kafka-2-data:
   kafka-3-data:
+  cassandra-1-data:
+  cassandra-2-data:
 
 services:
 
@@ -272,8 +304,12 @@ services:
       start_period: 20s
 
   # ── Topic initialisation (one-shot) ─────────────────────────────
-  # Runs after all 3 brokers are healthy, creates source + sink topics
-  # with 6 partitions (2 per mirror instance) and RF=3, min.isr=2.
+  # Creates:
+  #   • kolkata-locations-raw     (6p, RF=3, min.isr=2)
+  #   • kolkata-locations-mirror  (6p, RF=3, min.isr=2)
+  #   • _connect-configs          (1p, RF=3) -- Kafka Connect internal
+  #   • _connect-offsets          (25p, RF=3) -- Kafka Connect internal
+  #   • _connect-status           (5p, RF=3) -- Kafka Connect internal
   kafka-init:
     image: confluentinc/cp-kafka:7.6.0
     container_name: kafka-init
@@ -289,8 +325,10 @@ services:
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
+        set -e
         echo "[INIT] Creating Kafka topics ..."
 
+        # ── Application topics ───────────────────────────────────────
         kafka-topics --bootstrap-server kafka-1:29092 \
           --create --if-not-exists \
           --topic kolkata-locations-raw \
@@ -307,9 +345,181 @@ services:
           --config min.insync.replicas=2 \
           --config retention.ms=604800000
 
+        # ── Kafka Connect internal topics ────────────────────────────
+        # compact + delete for configs; delete for offsets & status
+        kafka-topics --bootstrap-server kafka-1:29092 \
+          --create --if-not-exists \
+          --topic _connect-configs \
+          --partitions 1 \
+          --replication-factor 3 \
+          --config cleanup.policy=compact \
+          --config min.insync.replicas=2
+
+        kafka-topics --bootstrap-server kafka-1:29092 \
+          --create --if-not-exists \
+          --topic _connect-offsets \
+          --partitions 25 \
+          --replication-factor 3 \
+          --config cleanup.policy=compact \
+          --config min.insync.replicas=2
+
+        kafka-topics --bootstrap-server kafka-1:29092 \
+          --create --if-not-exists \
+          --topic _connect-status \
+          --partitions 5 \
+          --replication-factor 3 \
+          --config cleanup.policy=compact \
+          --config min.insync.replicas=2
+
         echo "[INIT] Topics created:"
         kafka-topics --bootstrap-server kafka-1:29092 --list
         echo "[INIT] Done."
+
+  # ─────────────────────────────────────────────────────────────────
+  #  CASSANDRA CLUSTER  (2-node, datacenter1, RF=2)
+  # ─────────────────────────────────────────────────────────────────
+
+  # ── Cassandra Node 1  (seed) ─────────────────────────────────────
+  cassandra-1:
+    <<: *cassandra-common
+    container_name: cassandra-1
+    ports:
+      - "9042:9042"     # CQL
+    volumes:
+      - cassandra-1-data:/var/lib/cassandra
+    environment:
+      <<: *cassandra-common-env
+      # No CASSANDRA_SEEDS → this node bootstraps as the seed itself
+    healthcheck:
+      # Passes when this node reports itself as Up/Normal (UN)
+      test:
+        - "CMD-SHELL"
+        - "nodetool status 2>&1 | grep -E '^UN\\s' | grep -q ."
+      interval: 20s
+      timeout: 10s
+      retries: 15
+      start_period: 60s
+
+  # ── Cassandra Node 2 ─────────────────────────────────────────────
+  cassandra-2:
+    <<: *cassandra-common
+    container_name: cassandra-2
+    ports:
+      - "9043:9042"     # CQL exposed on 9043 externally to avoid clash
+    volumes:
+      - cassandra-2-data:/var/lib/cassandra
+    environment:
+      <<: *cassandra-common-env
+      CASSANDRA_SEEDS: "cassandra-1"
+    depends_on:
+      cassandra-1:
+        condition: service_healthy
+    healthcheck:
+      # Passes when BOTH nodes show as UN (ring is fully formed)
+      test:
+        - "CMD-SHELL"
+        - "[ $(nodetool status 2>&1 | grep -c '^UN') -ge 2 ]"
+      interval: 20s
+      timeout: 10s
+      retries: 20
+      start_period: 90s
+
+  # ── Cassandra schema init (one-shot) ────────────────────────────
+  # Creates keyspace kolkata (RF=2, NetworkTopologyStrategy)
+  # and table kolkata.locations to receive sinked data.
+  cassandra-init:
+    image: cassandra:4.1
+    container_name: cassandra-init
+    networks:
+      - kafka-net
+    depends_on:
+      cassandra-2:
+        condition: service_healthy
+    volumes:
+      - ./cassandra-init:/cassandra-init:ro
+    entrypoint: ["/bin/bash", "/cassandra-init/init.sh"]
+    restart: "no"
+
+  # ─────────────────────────────────────────────────────────────────
+  #  KAFKA CONNECT  (Distributed mode, DataStax Cassandra Sink)
+  # ─────────────────────────────────────────────────────────────────
+  kafka-connect:
+    build:
+      context: ./kafka-connect
+      dockerfile: Dockerfile
+    container_name: kafka-connect
+    restart: unless-stopped
+    networks:
+      - kafka-net
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      schema-registry-1:
+        condition: service_healthy
+      cassandra-2:
+        condition: service_healthy
+    ports:
+      - "8083:8083"
+    environment:
+      # ── Bootstrap ────────────────────────────────────────────────
+      CONNECT_BOOTSTRAP_SERVERS: "kafka-1:29092,kafka-2:29093,kafka-3:29094"
+      CONNECT_REST_ADVERTISED_HOST_NAME: kafka-connect
+      CONNECT_REST_PORT: 8083
+
+      # ── Distributed group ─────────────────────────────────────────
+      CONNECT_GROUP_ID: "kafka-connect-group"
+
+      # ── Internal storage topics (pre-created by kafka-init) ───────
+      CONNECT_CONFIG_STORAGE_TOPIC:         "_connect-configs"
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: 3
+      CONNECT_OFFSET_STORAGE_TOPIC:         "_connect-offsets"
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: 3
+      CONNECT_OFFSET_FLUSH_INTERVAL_MS:     5000    # flush offsets every 5 s
+      CONNECT_STATUS_STORAGE_TOPIC:         "_connect-status"
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: 3
+
+      # ── Default converters (overridden per-connector) ─────────────
+      CONNECT_KEY_CONVERTER:   "org.apache.kafka.connect.storage.StringConverter"
+      CONNECT_VALUE_CONVERTER: "io.confluent.connect.avro.AvroConverter"
+      CONNECT_VALUE_CONVERTER_SCHEMA_REGISTRY_URL: "http://schema-registry-1:8081"
+
+      # ── Plugin path ───────────────────────────────────────────────
+      CONNECT_PLUGIN_PATH: "/usr/share/java,/usr/share/confluent-hub-components"
+
+      # ── Logging ───────────────────────────────────────────────────
+      CONNECT_LOG4J_ROOT_LOGLEVEL: "INFO"
+      CONNECT_LOG4J_LOGGERS: >-
+        org.apache.kafka.connect.runtime.distributed=INFO,
+        com.datastax=WARN
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8083/ | grep -q version"]
+      interval: 15s
+      timeout: 10s
+      retries: 15
+      start_period: 90s
+
+  # ── Connector registration (one-shot) ───────────────────────────
+  # Registers the Cassandra Sink connector via the Connect REST API
+  # after both kafka-connect and cassandra-init are ready.
+  connector-init:
+    image: curlimages/curl:8.7.1
+    container_name: connector-init
+    networks:
+      - kafka-net
+    depends_on:
+      kafka-connect:
+        condition: service_healthy
+      cassandra-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./connector-init:/connector-init:ro
+    entrypoint: ["/bin/sh", "/connector-init/register-connector.sh"]
+    restart: "no"
+
+  # ─────────────────────────────────────────────────────────────────
+  #  MIRROR INSTANCES
+  # ─────────────────────────────────────────────────────────────────
 
   # ── Mirror instance 1 ───────────────────────────────────────────
   # cooperative-sticky assignor → gets partitions 0 & 1
@@ -352,30 +562,40 @@ services:
 #
 #  docker compose up --build
 #
-#  Watch mirror workers:
+#  ── Watch mirror workers: ──────────────────────────────────────────
 #    docker compose logs -f mirror-instance-1 mirror-instance-2 mirror-instance-3
 #
-#  Check KRaft quorum:
+#  ── Check KRaft quorum: ──────────────────────────────────────────
 #    docker exec kafka-1 kafka-metadata-quorum \
 #      --bootstrap-server localhost:9092 describe --status
 #
-#  Verify topic ISR:
+#  ── Verify topic ISR: ────────────────────────────────────────────
 #    docker exec kafka-1 kafka-topics \
 #      --bootstrap-server localhost:9092 --describe \
-#      --topic kolkata-locations-raw
+#      --topic kolkata-locations-mirror
 #
-#  Inspect sink topic (read_committed):
-#    docker exec kafka-1 kafka-console-consumer \
-#      --bootstrap-server localhost:9092 \
-#      --topic kolkata-locations-mirror \
-#      --from-beginning \
-#      --isolation-level read_committed
+#  ── Watch Cassandra sink connector status: ───────────────────────
+#    curl -s localhost:8083/connectors/cassandra-sink-kolkata-locations/status \
+#      | python3 -m json.tool
 #
-#  Simulate broker failure:
+#  ── Query sinked data in Cassandra: ─────────────────────────────
+#    docker exec -it cassandra-1 cqlsh -e \
+#      "SELECT id, name, zone, district FROM kolkata.locations LIMIT 20;"
+#
+#  ── Check Cassandra ring health: ────────────────────────────────
+#    docker exec cassandra-1 nodetool status
+#
+#  ── Simulate broker failure: ────────────────────────────────────
 #    docker stop kafka-2
 #    → ISR shrinks to [kafka-1, kafka-3] (size=2 >= min.isr=2) ✅
 #    → Mirror workers reconnect and continue
+#    → Kafka Connect reconnects and continues sinking
 #
-#  Full teardown:
+#  ── Simulate Cassandra node failure: ────────────────────────────
+#    docker stop cassandra-2
+#    → RF=2 with 1 live node; LOCAL_QUORUM requires 1/2 = 1 ✅
+#    → Sink connector continues with degraded consistency
+#
+#  ── Full teardown: ──────────────────────────────────────────────
 #    docker compose down -v
 # ═══════════════════════════════════════════════════════════════════
