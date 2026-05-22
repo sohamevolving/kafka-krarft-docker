@@ -36,6 +36,23 @@
      |                                 |-------------------------------------->|
      v                                 v                                       v
 
+In a typical "consume-transform-produce" loop, the process works as follows:Poll Records:
+The consumer pulls records from an input topic.Begin Transaction:
+The producer initiates a transaction via producer.beginTransaction().
+Produce Result: The application processes the data and the producer sends the new records to output topics using producer.send().
+ These records are written to the broker but remain "uncommitted" and invisible to downstream consumers using read_committed mode.
+ Send Offsets:
+ Instead of the consumer committing its own offsets, the producer sends them to the transaction coordinator using producer.sendOffsetsToTransaction().
+ Commit Transaction:
+ The producer calls producer.commitTransaction().
+ This atomically commits both the produced records and the consumer's offsets.
+
+
+
+
+
+
+
 
 =============================================================================
  STEP 2 -- Transactional Kafka Mirror  :  Topic 1  ->  Topic 2
