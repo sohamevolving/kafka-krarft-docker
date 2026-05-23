@@ -599,3 +599,54 @@ services:
 #  ── Full teardown: ──────────────────────────────────────────────
 #    docker compose down -v
 # ═══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
+#  ADD THIS BLOCK TO YOUR docker-compose.yml
+#
+#  1. Copy the `trino` service under `services:`
+#  2. The trino/ directory (created alongside this file) maps into
+#     the container at /etc/trino
+#  3. No additional volumes are needed — Trino is stateless for
+#     query purposes; the data lives in Kafka.
+#
+#  Trino REST UI  →  http://localhost:8080
+#  Trino CLI      →  docker exec -it trino trino --server localhost:8080
+#  Example query  →  SELECT * FROM kafka.default."kolkata-locations-mirror" LIMIT 20;
+# ═══════════════════════════════════════════════════════════════════
+
+  # ── Trino Coordinator ────────────────────────────────────────────
+  trino:
+    image: trinodb/trino:435
+    container_name: trino
+    restart: unless-stopped
+    networks:
+      - kafka-net
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      schema-registry-1:
+        condition: service_healthy
+      # Mirror instances must have started (data may be sparse at boot,
+      # but Trino can query an empty topic fine)
+      mirror-instance-1:
+        condition: service_started
+    ports:
+      - "8080:8080"
+    volumes:
+      # Mount the whole trino/etc directory so all config files are picked up
+      - ./trino/etc:/etc/trino:ro
+    environment:
+      # Trino reads config from /etc/trino — nothing extra needed here.
+      # Override JVM heap here if host RAM is tight:
+      # JAVA_TOOL_OPTIONS: "-Xmx2G"
+      JAVA_TOOL_OPTIONS: "-Xmx1G"
+    healthcheck:
+      # Trino's /v1/info returns {"starting":false} when ready
+      test:
+        - "CMD-SHELL"
+        - >
+          curl -sf http://localhost:8080/v1/info |
+          python3 -c "import sys,json; d=json.load(sys.stdin); sys.exit(0 if not d.get('starting',True) else 1)"
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
